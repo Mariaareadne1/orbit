@@ -1,8 +1,25 @@
 # Orbit
 
-**Spatial audio choreography.** Move sounds around a listener on a top-down soundstage; their positions drive real Web Audio HRTF panning, and the result can be rendered offline to a WAV.
+**Spatial audio choreography.** Move sounds around a listener on a top-down soundstage; their positions drive real Web Audio HRTF panning, and the arrangement renders offline to a WAV that pans the way playback did.
 
-> Status: **DSP proof (O0–O1) complete and measured.** The choreography editor is being built on top of it; see [PROGRESS.md](PROGRESS.md) for what exists today.
+![Orbit: three voices around the listener, one following a drawn figure-eight](docs/media/orbit-figure-eight.jpg)
+
+**Live:** https://mariaareadne1.github.io/orbit/ · use headphones · MIT
+
+## What it does
+
+- **A soundstage, not a mixer.** The listener sits at the centre facing up the screen; rings mark metres, the edge marks direction. Up to six voices: three built-in sounds generated in code (drone, plucks, pulse) or your own audio files (WAV/MP3/M4A/OGG/FLAC, decoded locally, mixed to mono, never uploaded).
+- **Three ways to move a voice.** *Place* drags it to a fixed spot (arrow keys nudge it). *Draw* sketches a path that is spread evenly across the piece. *Perform* records your hand live while the music plays — the audio follows you as you move and the recording replaces that stretch of the path. Presets for orbits and passes.
+- **A timeline of direction.** Each lane plots where its voice is heading over time (centre = ahead). Play, pause, seek, loop, change the length; mute, solo and level per voice; undo and redo; autosave (imported audio kept in IndexedDB).
+- **Export WAV.** The same graph rendered offline at 48 kHz, 16-bit stereo, with peak level and any clipping reported.
+
+## How it stays honest
+
+Positions are scheduled on each `PannerNode`'s AudioParams ahead of time with `linearRampToValueAtTime`, so motion is sample-accurate and independent of the frame rate; the stage only *reads* the same interpolation to draw. Loops are scheduled a quarter-second before each cycle ends. Live playback runs at 48 kHz like the export because browser HRTF kernels depend on the sample rate — before that change, live and exported panning differed by about 0.4 dB.
+
+**Live vs export, measured:** a test taps the live master output with an AudioWorklet during real-time playback of a left-to-right pass, renders the same arrangement offline, and compares left/right balance in half-second windows: the largest difference is **0.06 dB** in Chromium and **0.05 dB** in WebKit.
+
+> The sections below document the DSP proof the editor is built on.
 
 ## Conventions
 
@@ -33,5 +50,8 @@ The sweep is also encoded to 16-bit WAV in the page and checked outside the brow
 ```bash
 pnpm install
 pnpm test        # unit: coordinates, paths, analysis, WAV
-pnpm test:e2e    # browser: the DSP proof in Chromium and WebKit, WAV checked with python + ffprobe
+pnpm test:e2e    # browser: the proof and the editor in Chromium and WebKit (20 tests): live vs export
+                 # parity, path tools, perform recording, looping, mute/solo in exports, import + reload,
+                 # corrupt-save recovery, phone layout; WAVs checked with python + ffprobe
+pnpm dev         # http://localhost:5431
 ```

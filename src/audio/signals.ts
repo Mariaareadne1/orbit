@@ -59,3 +59,16 @@ export function drone(seconds: number, sampleRate: number, freq = 110, peak = 0.
   }
   return out
 }
+
+/** A soft low pulse: a pitched-down sine thump every `every` seconds. */
+export function pulse(seconds: number, sampleRate: number, every = 0.5, peak = 0.55): Float32Array {
+  const n = Math.round(seconds * sampleRate)
+  const out = new Float32Array(n)
+  const period = Math.round(every * sampleRate)
+  for (let i = 0; i < n; i++) {
+    const t = (i % period) / sampleRate
+    const f = 55 + 70 * Math.exp(-t * 30)
+    out[i] = peak * Math.exp(-t * 9) * Math.sin(2 * Math.PI * f * t)
+  }
+  return out
+}

@@ -28,8 +28,16 @@ def seg(xs, a, b):
 
 
 dur = frames / rate
-first = 20 * math.log10(rms(seg(right, 0, 1)) / rms(seg(left, 0, 1)))
-last = 20 * math.log10(rms(seg(right, dur - 1, dur)) / rms(seg(left, dur - 1, dur)))
+
+
+def balance(a, b):
+    """Right-minus-left level in dB, or None for silence."""
+    l, r = rms(seg(left, a, b)), rms(seg(right, a, b))
+    return None if l == 0 or r == 0 else 20 * math.log10(r / l)
+
+
+first = balance(0, 1)
+last = balance(dur - 1, dur)
 peak = max(abs(x) for x in samples) / 32768.0
 print(json.dumps({"channels": ch, "sampleWidth": width, "sampleRate": rate, "frames": frames,
                   "durationSeconds": dur, "firstSecondBalanceDb": first, "lastSecondBalanceDb": last, "peak": peak}))
