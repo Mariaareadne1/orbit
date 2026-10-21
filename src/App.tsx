@@ -70,7 +70,8 @@ export default function App() {
       )}
       <main className="observatory">
         <Stage doc={doc} engine={engine} playing={playing} selected={selected} tool={tool}
-          onSelect={setSelected} onPreviewPath={onPreviewPath} onCommitPath={onCommitPath} onTime={onTime} />
+          onSelect={setSelected} onPreviewPath={onPreviewPath} onCommitPath={onCommitPath} onTime={onTime}
+          stillTime={playing ? -1 : time} />
         <Voices orbit={orbit} selected={selected} tool={tool} time={time} onSelect={setSelected} onTool={setTool} />
       </main>
       <Timeline doc={doc} time={time} playing={playing} selected={selected}

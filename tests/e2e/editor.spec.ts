@@ -272,17 +272,16 @@ test('a corrupt saved orbit is kept aside and reported', async ({ page }) => {
 })
 
 test('looping continues into the next cycle without stopping', async ({ page }) => {
-  test.setTimeout(60_000)
+  test.setTimeout(90_000)
   await openWith(page, { ...PASS_DOC, duration: 4, loop: true, voices: PASS_DOC.voices.map((v) => ({ ...v, path: [{ t: 0, x: -4, y: 1 }, { t: 4, x: 4, y: 1 }] })) })
   await page.getByTestId('play').click()
-  await page.waitForTimeout(5200)
-  const state = await page.evaluate(() => {
-    const e = (window as unknown as { orbit: { engine: { time: () => number; playing: boolean } } }).orbit.engine
-    return { t: e.time(), playing: e.playing }
-  })
-  expect(state.playing).toBe(true)
-  expect(state.t).toBeGreaterThan(0.5)
-  expect(state.t).toBeLessThan(2.5)
+  // Wait on the audio clock, not wall time: watch the piece time pass ~3.5 s, then wrap.
+  let peak = 0
+  await expect.poll(async () => {
+    const s = await engineState(page)
+    peak = Math.max(peak, s.t)
+    return peak > 3.5 && s.t < 2 && s.playing
+  }, { timeout: 60_000, intervals: [100] }).toBe(true)
   await expect(page.getByTestId('play')).toHaveAttribute('aria-label', 'Pause')
 })
 
@@ -295,4 +294,73 @@ test('phone layout: stage first, no horizontal scroll', async ({ browser }) => {
   expect(stage.x + stage.width).toBeLessThanOrEqual(391)
   expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(0)
   await ctx.close()
+})
+
+const engineState = (page: Page) => page.evaluate(() => {
+  const e = (window as unknown as { orbit: { engine: { time: () => number; playing: boolean } } }).orbit.engine
+  return { t: e.time(), playing: e.playing }
+})
+
+test('turning Loop off while playing ends at the end of the cycle', async ({ page }) => {
+  test.setTimeout(60_000)
+  await openWith(page, { ...PASS_DOC, duration: 4, loop: true })
+  await page.getByTestId('play').click()
+  await page.waitForTimeout(1500)
+  await page.getByLabel('Loop').uncheck()
+  await expect(page.getByTestId('play')).toHaveAttribute('aria-label', 'Play', { timeout: 6000 })
+  expect((await engineState(page)).playing).toBe(false)
+})
+
+test('seeking right before a loop boundary keeps the clock consistent', async ({ page }) => {
+  test.setTimeout(90_000)
+  await openWith(page, { ...PASS_DOC, duration: 4, loop: true })
+  await page.getByTestId('play').click()
+  await page.evaluate(() => {
+    const o = (window as unknown as { orbit: { engine: { seek: (d: unknown, t: number) => Promise<void> }; doc: () => unknown } }).orbit
+    return o.engine.seek(o.doc(), 3.9)
+  })
+  // Once the clock wraps into the next cycle it must count up from ~0 — not jump a whole cycle.
+  await expect.poll(async () => (await engineState(page)).t, { timeout: 60_000, intervals: [50] }).toBeLessThan(1)
+  const a = await engineState(page)
+  await expect.poll(async () => (await engineState(page)).t, { timeout: 60_000, intervals: [50] }).toBeGreaterThan(a.t + 0.2)
+  const b = await engineState(page)
+  expect(b.playing).toBe(true)
+  expect(b.t).toBeLessThan(3)
+})
+
+test('a Perform click without moving hands the voice back to its path', async ({ page }) => {
+  await openWith(page, PASS_DOC)
+  await page.getByRole('button', { name: /Perform/ }).click()
+  await page.getByTestId('play').click()
+  await page.waitForTimeout(500)
+  const box = (await page.getByTestId('stage').boundingBox())!
+  await page.mouse.move(box.x + box.width * 0.5, box.y + box.height * 0.15)
+  await page.mouse.down()
+  await page.mouse.up()
+  await page.waitForTimeout(600)
+  const { x, expected } = await page.evaluate(() => {
+    const o = (window as unknown as { orbit: { engine: { time: () => number; active: Array<{ panner: PannerNode }> } } }).orbit
+    const t = o.engine.time()
+    return { x: o.engine.active[0]!.panner.positionX.value, expected: -4 + (8 * t) / 8 }
+  })
+  expect(Math.abs(x - expected)).toBeLessThan(0.3)
+})
+
+test('undo back to the original document is saved too', async ({ page }) => {
+  await openWith(page, null)
+  await page.getByRole('button', { name: /Pass L→R/ }).click()
+  await page.waitForTimeout(500)
+  await page.getByRole('button', { name: 'Undo' }).click()
+  await page.waitForTimeout(500)
+  const before = (await getDoc(page)).voices.find((v) => v.name === 'Plucks')!.path.length
+  await page.reload()
+  expect((await getDoc(page)).voices.find((v) => v.name === 'Plucks')!.path.length).toBe(before)
+})
+
+test('seeking while paused redraws the stage', async ({ page }) => {
+  await openWith(page, PASS_DOC)
+  const before = await page.getByTestId('node-Drone').getAttribute('transform')
+  const tl = (await page.getByTestId('timeline').boundingBox())!
+  await page.mouse.click(tl.x + tl.width * 0.75, tl.y + tl.height / 2)
+  await expect.poll(() => page.getByTestId('node-Drone').getAttribute('transform')).not.toBe(before)
 })

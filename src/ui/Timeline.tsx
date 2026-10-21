@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { azimuth } from '../audio/coords'
 import { positionAt } from '../audio/path'
 import { DURATION_LIMITS, type OrbitDoc } from '../state/document'
@@ -25,6 +25,15 @@ const fmt = (t: number) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart
 /** Each lane plots the voice's azimuth over time: centre line = ahead, up = right, down = left. */
 export function Timeline({ doc, time, playing, selected, onSeek, onPlay, onPause, onStop, onDuration, onLoop, onSelect }: TimelineProps) {
   const svg = useRef<SVGSVGElement>(null)
+  const [lengthDraft, setLengthDraft] = useState<string | null>(null)
+  useEffect(() => setLengthDraft(null), [doc.duration])
+  const applyLength = () => {
+    if (lengthDraft === null) return
+    const v = Number(lengthDraft)
+    if (Number.isFinite(v) && v >= DURATION_LIMITS.min && v <= DURATION_LIMITS.max) onDuration(Math.round(v))
+    setLengthDraft(null)
+  }
+  const lastSeek = useRef(0)
   const H = Math.max(1, doc.voices.length) * LANE + 18
   const x = (t: number) => (t / doc.duration) * W
   const seekFrom = (clientX: number) => {
@@ -47,11 +56,11 @@ export function Timeline({ doc, time, playing, selected, onSeek, onPlay, onPause
         </label>
         <label className="duration">
           Length
-          <input type="number" min={DURATION_LIMITS.min} max={DURATION_LIMITS.max} step={1} value={doc.duration}
-            onChange={(e) => {
-              const v = Number(e.target.value)
-              if (Number.isFinite(v) && v >= DURATION_LIMITS.min && v <= DURATION_LIMITS.max) onDuration(v)
-            }} /> s
+          <input type="number" min={DURATION_LIMITS.min} max={DURATION_LIMITS.max} step={1} value={lengthDraft ?? doc.duration}
+            aria-label={`Length in seconds, ${DURATION_LIMITS.min} to ${DURATION_LIMITS.max}`}
+            onChange={(e) => setLengthDraft(e.target.value)}
+            onBlur={applyLength}
+            onKeyDown={(e) => { if (e.key === 'Enter') applyLength(); if (e.key === 'Escape') setLengthDraft(null) }} /> s
         </label>
       </div>
       <svg
@@ -71,7 +80,12 @@ export function Timeline({ doc, time, playing, selected, onSeek, onPlay, onPause
           e.currentTarget.setPointerCapture(e.pointerId)
           seekFrom(e.clientX)
         }}
-        onPointerMove={(e) => e.buttons === 1 && seekFrom(e.clientX)}
+        onPointerMove={(e) => {
+          // Scrubbing while playing restarts sources; at most every 60 ms.
+          if (e.buttons !== 1 || performance.now() - lastSeek.current < 60) return
+          lastSeek.current = performance.now()
+          seekFrom(e.clientX)
+        }}
         onKeyDown={(e) => {
           const step = e.shiftKey ? 5 : 1
           if (e.key === 'ArrowRight') onSeek(Math.min(doc.duration, time + step))

@@ -41,28 +41,42 @@ export function useOrbit() {
   const [notice, setNotice] = useState<string | null>(
     boot.status === 'unreadable' ? `Your saved orbit couldn’t be read (${boot.reason}). A copy was kept in this browser; starting fresh.` : null,
   )
+  /** voice ids whose imported audio could not be restored */
   const [missing, setMissing] = useState<string[]>([])
   const [playing, setPlaying] = useState(false)
   const initial = useRef(doc)
+  const latest = useRef(doc)
+  latest.current = doc
+  /** the last document written to storage (the loaded one counts as written) */
+  const lastSaved = useRef<OrbitDoc | null>(boot.status === 'ok' ? doc : null)
 
   // Restore imported audio from IndexedDB.
   useEffect(() => {
     let cancelled = false
     ;(async () => {
-      const lost: string[] = []
+      const lost: VoiceDoc[] = []
+      const referenced = new Set(initial.current.voices.flatMap((v) => (v.source.kind === 'file' ? [v.source.blobId] : [])))
+      // Files no saved voice uses (removed or replaced in an earlier session) are deleted
+      // here, at boot, when no undo history can still refer to them.
+      try {
+        for (const key of await files.keys()) if (!referenced.has(String(key))) await files.remove(String(key))
+      } catch {
+        // storage unavailable: nothing to clean
+      }
       for (const v of initial.current.voices) {
+        if (cancelled) return
         if (v.source.kind !== 'file' || engine.bank.hasFile(v.source.blobId)) continue
         try {
           const bytes = await files.get(v.source.blobId)
           if (!bytes) throw new Error('missing')
           engine.bank.addFile(v.source.blobId, await decodeAudioFile(bytes))
         } catch {
-          lost.push(v.name)
+          lost.push(v)
         }
       }
       if (!cancelled && lost.length) {
-        setMissing(lost)
-        setNotice(`Audio for ${lost.join(', ')} isn’t in this browser’s storage any more; those voices are silent until you replace their sound.`)
+        setMissing(lost.map((v) => v.id))
+        setNotice(`Audio for ${lost.map((v) => v.name).join(', ')} isn’t in this browser’s storage any more; those voices are silent until you replace their sound.`)
       }
     })()
     return () => {
@@ -73,12 +87,22 @@ export function useOrbit() {
   // Autosave once something changed; never during a gesture.
   const gestureOpen = history.gestureStart !== null
   useEffect(() => {
-    if (gestureOpen || doc === initial.current) return
+    if (gestureOpen || doc === lastSaved.current || (lastSaved.current === null && doc === initial.current)) return
     const t = window.setTimeout(() => {
-      if (!saveDoc(doc)) setNotice('Browser storage is full; this orbit is not being saved.')
+      if (saveDoc(doc)) lastSaved.current = doc
+      else setNotice('Browser storage is full; this orbit is not being saved.')
     }, 300)
     return () => window.clearTimeout(t)
   }, [doc, gestureOpen])
+
+  // Flush when the page is hidden so an edit inside the save delay survives a close.
+  useEffect(() => {
+    const flush = () => {
+      if (latest.current !== lastSaved.current && latest.current !== initial.current && saveDoc(latest.current)) lastSaved.current = latest.current
+    }
+    window.addEventListener('pagehide', flush)
+    return () => window.removeEventListener('pagehide', flush)
+  }, [])
 
   // Keep the engine on the latest document while playing.
   useEffect(() => {
@@ -92,8 +116,6 @@ export function useOrbit() {
     }
   }, [engine])
 
-  const latest = useRef(doc)
-  latest.current = doc
   useEffect(() => registerDebug({ engine, doc: () => latest.current }), [engine])
 
   const patchVoice = useCallback((id: string, patch: Partial<VoiceDoc>, mode: 'push' | 'preview' = 'push') => {
@@ -155,7 +177,7 @@ export function useOrbit() {
         const d = latest.current
         if (id) {
           patchVoice(id, { source, name: file.name.replace(/\.[a-z0-9]+$/i, '').slice(0, 40) || 'Audio' })
-          setMissing((m) => m.filter((n) => n !== d.voices.find((v) => v.id === id)?.name))
+          setMissing((m) => m.filter((x) => x !== id))
           return id
         }
         if (d.voices.length >= MAX_VOICES) throw new Error(`An orbit holds at most ${MAX_VOICES} voices.`)

@@ -11,7 +11,14 @@ export default defineConfig({
     viewport: { width: 1440, height: 900 },
     trace: 'retain-on-failure',
     // Headless Chrome on macOS is far smoother on Metal than SwiftShader.
-    launchOptions: { args: process.platform === 'darwin' ? ['--use-angle=metal'] : [] },
+    // ORBIT_FAKE_AUDIO=1 uses Chromium's fake audio sink, whose clock runs even when the
+    // machine's audio output is unavailable (observed on macOS after a restart).
+    launchOptions: {
+      args: [
+        ...(process.platform === 'darwin' ? ['--use-angle=metal'] : []),
+        ...(process.env.ORBIT_FAKE_AUDIO ? ['--disable-audio-output'] : []),
+      ],
+    },
   },
   webServer: {
     command: 'pnpm dev',

@@ -54,6 +54,8 @@ async function tx<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBReq
       resolve(r.result)
     }
     t.onerror = () => reject(t.error)
+    // Quota failures surface as an abort at commit, not a request error.
+    t.onabort = () => reject(t.error ?? new Error('Storage transaction aborted'))
   })
 }
 
@@ -61,4 +63,5 @@ export const files = {
   put: (id: string, bytes: ArrayBuffer) => tx('readwrite', (s) => s.put(bytes, id)),
   get: (id: string) => tx<ArrayBuffer | undefined>('readonly', (s) => s.get(id)),
   remove: (id: string) => tx('readwrite', (s) => s.delete(id)),
+  keys: () => tx<IDBValidKey[]>('readonly', (s) => s.getAllKeys()),
 }

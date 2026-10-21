@@ -16,6 +16,8 @@ interface StageProps {
   onPreviewPath: (id: string, path: Keyframe[]) => void
   onCommitPath: (id: string, path: Keyframe[]) => void
   onTime: (t: number) => void
+  /** when paused, the time to draw at (changes on seek so the stage redraws) */
+  stillTime: number
 }
 
 const SIZE = 640
@@ -54,12 +56,16 @@ export function mergeRecording(path: readonly Keyframe[], rec: readonly Keyframe
   const t1 = rec[rec.length - 1]!.t
   const before = path.filter((k) => k.t < t0)
   const after = path.filter((k) => k.t > t1)
-  // Anchor the untouched parts so the path doesn't jump at the seams.
-  const anchorBefore = before.length || t0 === 0 ? [] : [{ t: Math.max(0, t0 - 0.001), ...positionAt(path, t0) }]
-  return [...before, ...anchorBefore, ...rec, ...after]
+  // Hold the old path's position right up to the recording, and resume it right
+  // after, so the untouched stretches don't drift toward the recorded points.
+  const lastBefore = before[before.length - 1]
+  const anchorBefore = t0 > 0.002 && (!lastBefore || lastBefore.t < t0 - 0.002) ? [{ t: t0 - 0.001, ...positionAt(path, t0 - 0.001) }] : []
+  const firstAfter = after[0]
+  const anchorAfter = firstAfter && firstAfter.t > t1 + 0.002 ? [{ t: t1 + 0.001, ...positionAt(path, t1 + 0.001) }] : []
+  return [...before, ...anchorBefore, ...rec, ...anchorAfter, ...after]
 }
 
-export function Stage({ doc, engine, playing, selected, tool, onSelect, onPreviewPath, onCommitPath, onTime }: StageProps) {
+export function Stage({ doc, engine, playing, selected, tool, onSelect, onPreviewPath, onCommitPath, onTime, stillTime }: StageProps) {
   const svg = useRef<SVGSVGElement>(null)
   const nodes = useRef(new Map<string, SVGGElement>())
   const trails = useRef(new Map<string, SVGPolylineElement>())
@@ -97,7 +103,7 @@ export function Stage({ doc, engine, playing, selected, tool, onSelect, onPrevie
     }
     frame()
     return () => cancelAnimationFrame(raf)
-  }, [engine, playing, doc, onTime])
+  }, [engine, playing, doc, onTime, stillTime])
 
   const pointFromEvent = (e: React.PointerEvent): StagePoint => {
     const r = svg.current!.getBoundingClientRect()
@@ -154,15 +160,15 @@ export function Stage({ doc, engine, playing, selected, tool, onSelect, onPrevie
     gesture.current = null
     if (!g) return
     const v = docRef.current.voices.find((x) => x.id === g.id)
+    if (g.kind === 'perform') engine.release()
     if (!v) return
     if (g.kind === 'place') onCommitPath(g.id, positionsOrSelf(v))
     else if (g.kind === 'draw') {
       const path = strokeToPath(stroke ?? [], docRef.current.duration)
       setStroke(null)
       if (path.length) onCommitPath(g.id, path)
-    } else {
-      engine.release()
-      if (g.rec.length > 1) onCommitPath(g.id, mergeRecording(v.path, g.rec))
+    } else if (g.rec.length > 1) {
+      onCommitPath(g.id, mergeRecording(v.path, g.rec))
     }
   }
 

@@ -68,7 +68,7 @@ export function Voices({ orbit, selected, tool, time, onSelect, onTool }: Voices
               </div>
               <p className="voice__source mono">
                 {v.source.kind === 'builtin' ? `${BUILTINS[v.source.id]} · generated` : `${v.source.name} · ${v.source.seconds.toFixed(1)} s`}
-                {missing.includes(v.name) && <span className="warn"> · audio missing</span>}
+                {missing.includes(v.id) && <span className="warn"> · audio missing</span>}
               </p>
             </li>
           )
