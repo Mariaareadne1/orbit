@@ -32,7 +32,19 @@ export interface OrbitDoc {
   voices: VoiceDoc[]
 }
 
-export const COLORS = ['#5ee7ff', '#ffb86b', '#b18cff', '#7cf2b0', '#ff7aa8', '#f5e663']
+/**
+ * Voice identities: a hue and (see ui/identity.ts) a shape at the same index, so a
+ * voice is recognisable without colour. Muted, light tones that read on ink navy.
+ */
+export const COLORS = ['#8fc7ff', '#e9d27c', '#c2a8ff', '#86ddb8', '#ff9fb4', '#d9dee8']
+/** The first palette; saved documents that use it are mapped index-for-index. */
+const LEGACY_COLORS = ['#5ee7ff', '#ffb86b', '#b18cff', '#7cf2b0', '#ff7aa8', '#f5e663']
+
+function readColor(v: unknown, i: number): string {
+  if (typeof v !== 'string' || !/^#[0-9a-f]{6}$/i.test(v)) return COLORS[i % COLORS.length]!
+  const legacy = LEGACY_COLORS.indexOf(v.toLowerCase())
+  return legacy >= 0 ? COLORS[legacy]! : v.toLowerCase()
+}
 
 export const newId = () => (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `v-${Math.random().toString(36).slice(2)}`)
 
@@ -101,7 +113,7 @@ export function parseDoc(raw: unknown): OrbitDoc {
     return {
       id: typeof v.id === 'string' && v.id.length < 100 ? v.id : newId(),
       name: cleanName(v.name, `Voice ${i + 1}`),
-      color: typeof v.color === 'string' && /^#[0-9a-f]{6}$/i.test(v.color) ? v.color : COLORS[i % COLORS.length]!,
+      color: readColor(v.color, i),
       source,
       gainDb: num(v.gainDb, `voices[${i}].gainDb`, GAIN_LIMITS_DB.min, GAIN_LIMITS_DB.max),
       mute: v.mute === true,

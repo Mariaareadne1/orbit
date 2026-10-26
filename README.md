@@ -1,23 +1,30 @@
-# Orbit
+# Orbit — Spatial Sound Theatre
 
-**Spatial audio choreography.** Move sounds around a listener on a top-down soundstage; their positions drive real Web Audio HRTF panning, and the arrangement renders offline to a WAV that pans the way playback did.
+**Conduct a small ensemble of sounds around a listener.** Place, draw or perform where each sound is; those positions drive real Web Audio HRTF panning, a score below shows where every sound is heading over time, and the arrangement renders offline to a WAV that pans the way playback did.
 
-![Orbit: three voices around the listener, one following a drawn figure-eight](docs/media/orbit-figure-eight.jpg)
+![Orbit: the soundstage with a drawn figure-eight, the Plucks card open, the six-lane score below](docs/media/orbit-figure-eight.jpg)
 
-**Live:** https://mariaareadne1.github.io/orbit/ · use headphones · MIT
+**Live:** https://mariaareadne1.github.io/orbit/ · headphones recommended · MIT
 
 ## What it does
 
-- **A soundstage, not a mixer.** The listener sits at the centre facing up the screen; rings mark metres, the edge marks direction. Up to six voices: three built-in sounds generated in code (drone, plucks, pulse) or your own audio files (WAV/MP3/M4A/OGG/FLAC, decoded locally, mixed to mono, never uploaded).
-- **Three ways to move a voice.** *Place* drags it to a fixed spot (arrow keys nudge it). *Draw* sketches a path that is spread evenly across the piece. *Perform* records your hand live while the music plays — the audio follows you as you move and the recording replaces that stretch of the path. Presets for orbits and passes.
-- **A timeline of direction.** Each lane plots where its voice is heading over time (centre = ahead). Play, pause, seek, loop, change the length; mute, solo and level per voice; undo and redo; autosave (imported audio kept in IndexedDB).
-- **Export WAV.** The same graph rendered offline at 48 kHz, 16-bit stereo, with peak level and any clipping reported.
+- **One stage.** A top-down room in metres: the listener at the centre facing the top, rings every metre to 5 m, an azimuth scale every 10°. Up to six sounds, each with a colour *and* a shape (circle, square, triangle, diamond, hexagon, cross): three generated in code (drone, plucks, pulse) or your own files (WAV/MP3/M4A/OGG/FLAC, decoded locally, mixed to mono, never uploaded).
+- **Three gestures.** *Place* (P) drags a sound to a fixed spot — or click empty floor to send the selected one there; arrow keys nudge. *Draw* (D) sketches a path spread evenly across the piece, with direction chevrons on the stage. *Perform* (R) records your hand against the playing music; the stage shows **● Rec** and the score highlights the stretch being replaced. A click without movement records nothing and hands the sound back to its path.
+- **A card per sound.** Pick a sound (stage, its name in the score, or keys 1–6) to open its card: origin, live x / y / distance / azimuth, level, mute, solo, motion presets (Hold here, orbits, a pass), replace sound, and a two-step remove.
+- **The score.** Six lanes plot each sound's direction over time (centre = ahead, up = right, down = left) under a playhead you can drag or move with arrow keys; empty lanes add sounds. Transport: play/pause, stop, loop, length (4–180 s, typed values explained if invalid), and an output meter read from AnalyserNodes on the live master — it shows nothing when nothing plays.
+- **Kept and exported.** Undo/redo (held arrow keys are one step), autosave plus an explicit Save with status, imported audio in IndexedDB (orphans cleaned at load), storage-full and blocked-audio states you can recover from. **Export WAV** renders the same graph offline at 48 kHz, 16-bit stereo, and reports peak, clipped samples and any sound skipped for missing audio.
+
+![Perform: Pulse being recorded live; the score marks the replaced stretch](docs/media/orbit-perform.jpg)
+
+<img src="docs/media/orbit-phone.jpg" width="300" alt="Orbit on a phone: stage first, mode tool, score, pinned transport">
+
+Before/after and the two composition studies that led here: `docs/media/before/`, `docs/media/studies/` (see DECISIONS.md D6–D8).
 
 ## How it stays honest
 
 Positions are scheduled on each `PannerNode`'s AudioParams ahead of time with `linearRampToValueAtTime`, so motion is sample-accurate and independent of the frame rate; the stage only *reads* the same interpolation to draw. Loops are scheduled a quarter-second before each cycle ends. Live playback runs at 48 kHz like the export because browser HRTF kernels depend on the sample rate — before that change, live and exported panning differed by about 0.4 dB.
 
-**Live vs export, measured:** a test taps the live master output with an AudioWorklet during real-time playback of a left-to-right pass, renders the same arrangement offline, and compares left/right balance in half-second windows: the largest difference is **0.06 dB** in Chromium and **0.05 dB** in WebKit.
+**Live vs export, measured:** a test taps the live master output with an AudioWorklet during real-time playback of a left-to-right pass, renders the same arrangement offline, and compares left/right balance in half-second windows: the largest difference is **0.04–0.06 dB** in Chromium and **0.05 dB** in WebKit (2026-10-25/26). A second test compares consecutive loop cycles the same way (**0.02–0.06 dB**): loops stay phase-aligned. The stage and score draw from the same interpolation the panners are scheduled with; a test places a sound mid-playback and reads the PannerNode's position back.
 
 > The sections below document the DSP proof the editor is built on.
 
@@ -49,9 +56,13 @@ The sweep is also encoded to 16-bit WAV in the page and checked outside the brow
 
 ```bash
 pnpm install
-pnpm test        # unit: coordinates, paths, analysis, WAV
-pnpm test:e2e    # browser: the proof and the editor in Chromium and WebKit (20 tests): live vs export
-                 # parity, path tools, perform recording, looping, mute/solo in exports, import + reload,
-                 # corrupt-save recovery, phone layout; WAVs checked with python + ffprobe
+pnpm test        # unit: coordinates, paths, gestures, analysis, WAV
+pnpm test:e2e    # browser, Chromium + WebKit (36 per engine, 2 file checks run once): proof, DSP fixtures (sine/noise L/R,
+                 # circle, distance) decoded by python `wave` + ffprobe, live vs export parity, loop
+                 # phase, panner read-back, gestures, keyboard, storage-full, GC, blocked audio, phone
+ORBIT_FAKE_AUDIO=1 pnpm test:e2e --project=chromium   # when the machine's audio output clock is stuck
+node scripts/screenshots.mjs   # README screenshots (needs pnpm dev)
 pnpm dev         # http://localhost:5431
 ```
+
+A representative export, `docs/media/samples/orbit-circle-pink-noise.wav` (4 s pink noise circling clockwise at 2 m): python `wave` reads 2 ch / 48 kHz / 16-bit / 4.000 s, first second +3.3 dB (right), last second −3.5 dB (left); ffprobe `pcm_s16le`.

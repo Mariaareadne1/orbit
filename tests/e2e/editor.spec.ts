@@ -1,84 +1,12 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test } from '@playwright/test'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DOC_KEY } from '../../src/state/storage'
 import { positionAt } from '../../src/audio/path'
 import { stageToScreen } from '../../src/audio/coords'
-import type { OrbitDoc } from '../../src/state/document'
-
-const TMP = mkdtempSync(join(tmpdir(), 'orbit-e2e-'))
-
-/** One voice passing left → right across the front, no loop. */
-const PASS_DOC: OrbitDoc = {
-  version: 1, name: 'Pass test', duration: 8, loop: false,
-  voices: [{ id: 'v1', name: 'Drone', color: '#5ee7ff', source: { kind: 'builtin', id: 'drone' }, gainDb: 0, mute: false, solo: false,
-    path: [{ t: 0, x: -4, y: 1 }, { t: 8, x: 4, y: 1 }] }],
-}
-
-async function openWith(page: Page, doc: OrbitDoc | null) {
-  await page.addInitScript(({ key, value }) => {
-    if (sessionStorage.getItem('seeded')) return
-    sessionStorage.setItem('seeded', '1')
-    localStorage.clear()
-    if (value) localStorage.setItem(key, value)
-  }, { key: DOC_KEY, value: doc ? JSON.stringify(doc) : null })
-  const errors: string[] = []
-  page.on('pageerror', (e) => errors.push(e.message))
-  page.on('console', (m) => m.type() === 'error' && errors.push(m.text()))
-  await page.goto('/')
-  await expect(page.getByTestId('stage')).toBeVisible()
-  return errors
-}
-
-const getDoc = (page: Page) => page.evaluate(() => (window as unknown as { orbit: { doc: () => OrbitDoc } }).orbit.doc())
-
-/** Tap the live master output with an AudioWorklet; returns a stop() that yields per-block levels in piece time. */
-async function startTap(page: Page) {
-  await page.evaluate(async () => {
-    const o = (window as unknown as { orbit: { engine: { context: AudioContext; output: GainNode } } }).orbit
-    const ctx = o.engine.context
-    const code = `class Tap extends AudioWorkletProcessor {
-      process(inputs) {
-        const i = inputs[0]
-        if (i && i.length === 2) {
-          let l = 0, r = 0
-          for (let k = 0; k < i[0].length; k++) { l += i[0][k] * i[0][k]; r += i[1][k] * i[1][k] }
-          this.port.postMessage([currentTime, l, r, i[0].length])
-        }
-        return true
-      }
-    }
-    registerProcessor('tap', Tap)`
-    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })))
-    const node = new AudioWorkletNode(ctx, 'tap', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] })
-    const sink = new GainNode(ctx, { gain: 0 })
-    o.engine.output.connect(node).connect(sink).connect(ctx.destination)
-    const w = window as unknown as { __tap: number[][] }
-    w.__tap = []
-    node.port.onmessage = (e) => w.__tap.push(e.data)
-  })
-}
-
-async function stopTap(page: Page) {
-  return page.evaluate(() => {
-    const w = window as unknown as { __tap: number[][]; orbit: { engine: { pieceTimeAt: (t: number) => number } } }
-    return w.__tap.map(([t, l, r, n]) => ({ t: w.orbit.engine.pieceTimeAt(t!), l: l!, r: r!, n: n! }))
-  })
-}
-
-/** Balance (dB) in windows of `size` seconds from per-block energies. */
-function balanceCurve(blocks: Array<{ t: number; l: number; r: number }>, size: number, end: number) {
-  const out: Array<{ t: number; db: number }> = []
-  for (let a = 0; a + size <= end; a += size) {
-    const inW = blocks.filter((b) => b.t >= a && b.t < a + size)
-    const l = inW.reduce((s, b) => s + b.l, 0)
-    const r = inW.reduce((s, b) => s + b.r, 0)
-    if (l > 0 && r > 0) out.push({ t: a + size / 2, db: 10 * Math.log10(r / l) })
-  }
-  return out
-}
+import { CENTER, SCALE } from '../../src/ui/geometry'
+import { balanceCurve, engineState, getDoc, openWith, PASS_DOC, startTap, stopTap, TMP, toneWav } from './helpers'
 
 test('live playback and the exported WAV pan the same way over time', async ({ page, browserName }) => {
   test.setTimeout(90_000)
@@ -132,7 +60,7 @@ test('the stage draws each voice where the path says it is', async ({ page }) =>
   await page.getByRole('button', { name: 'Pause' }).click()
   const t = await page.evaluate(() => (window as unknown as { orbit: { engine: { time: () => number } } }).orbit.engine.time())
   const plucks = doc.voices.find((v) => v.name === 'Plucks')!
-  const expected = stageToScreen(positionAt(plucks.path, t), 320, 320, (640 / 2 - 46) / 5)
+  const expected = stageToScreen(positionAt(plucks.path, t), CENTER, CENTER, SCALE)
   const transform = await page.getByTestId('node-Plucks').getAttribute('transform')
   const [px, py] = transform!.match(/translate\(([-\d.]+) ([-\d.]+)\)/)!.slice(1).map(Number)
   expect(Math.abs(px! - expected.px)).toBeLessThan(1.5)
@@ -146,7 +74,8 @@ test('draw, place and undo shape the paths', async ({ page }) => {
   const stage = page.getByTestId('stage')
   const box = (await stage.boundingBox())!
   const at = (fx: number, fy: number) => ({ x: box.x + box.width * fx, y: box.y + box.height * fy })
-  // Draw a stroke for the selected voice (Plucks, default tool Draw).
+  // Draw a stroke for the selected voice (Plucks).
+  await page.getByRole('button', { name: 'Draw', exact: true }).click()
   const before = (await getDoc(page)).voices.find((v) => v.name === 'Plucks')!.path
   const p0 = at(0.3, 0.3)
   await page.mouse.move(p0.x, p0.y)
@@ -162,8 +91,8 @@ test('draw, place and undo shape the paths', async ({ page }) => {
   expect((await getDoc(page)).voices.find((v) => v.name === 'Plucks')!.path).toEqual(before)
 
   // Place: Drone to the right of the listener.
-  await page.getByRole('button', { name: /Drone/ }).first().click()
-  await page.getByRole('button', { name: /Place/ }).click()
+  await page.getByRole('button', { name: 'Place', exact: true }).click()
+  await page.getByTestId('node-Drone').click()
   const right = at(0.8, 0.5)
   await page.mouse.move(right.x, right.y)
   await page.mouse.down()
@@ -172,8 +101,8 @@ test('draw, place and undo shape the paths', async ({ page }) => {
   expect(drone.path).toHaveLength(1)
   expect(drone.path[0]!.x).toBeGreaterThan(2)
   expect(Math.abs(drone.path[0]!.y)).toBeLessThan(0.3)
-  // Keyboard nudge.
-  await stage.focus()
+  // Keyboard nudge on the focused source.
+  await page.getByTestId('node-Drone').focus()
   await page.keyboard.press('ArrowUp')
   const nudged = (await getDoc(page)).voices.find((v) => v.name === 'Drone')!.path[0]!
   expect(nudged.y).toBeCloseTo(drone.path[0]!.y + 0.1, 3)
@@ -182,7 +111,7 @@ test('draw, place and undo shape the paths', async ({ page }) => {
 test('perform records live motion into the path', async ({ page }) => {
   await openWith(page, null)
   const original = (await getDoc(page)).voices.find((v) => v.name === 'Plucks')!.path
-  await page.getByRole('button', { name: /Perform/ }).click()
+  await page.getByRole('button', { name: 'Perform', exact: true }).click()
   await page.getByTestId('play').click()
   await page.waitForTimeout(400)
   const box = (await page.getByTestId('stage').boundingBox())!
@@ -235,22 +164,14 @@ test('mute, solo and level change the export; the WAV is valid', async ({ page, 
 
 test('imported audio becomes a voice and survives a reload; bad files are refused', async ({ page }) => {
   await openWith(page, null)
-  // A 2 s 440 Hz WAV generated here.
-  const sr = 48000
-  const n = sr * 2
-  const buf = Buffer.alloc(44 + n * 2)
-  buf.write('RIFF', 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write('WAVE', 8); buf.write('fmt ', 12)
-  buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22); buf.writeUInt32LE(sr, 24)
-  buf.writeUInt32LE(sr * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34); buf.write('data', 36); buf.writeUInt32LE(n * 2, 40)
-  for (let i = 0; i < n; i++) buf.writeInt16LE(Math.round(Math.sin((2 * Math.PI * 440 * i) / sr) * 12000), 44 + i * 2)
   const wav = join(TMP, 'bell-tone.wav')
-  writeFileSync(wav, buf)
+  writeFileSync(wav, toneWav(2, 440))
   await page.getByTestId('audio-input').setInputFiles(wav)
-  await expect(page.getByRole('button', { name: /^bell-tone/ })).toBeVisible()
+  await expect(page.getByTestId('node-bell-tone')).toBeVisible()
   await expect(page.getByText('bell-tone.wav · 2.0 s')).toBeVisible()
   await page.waitForTimeout(500)
   await page.reload()
-  await expect(page.getByRole('button', { name: /^bell-tone/ })).toBeVisible()
+  await expect(page.getByTestId('node-bell-tone')).toBeVisible()
   await expect(page.getByText('audio missing')).toHaveCount(0)
 
   const fake = join(TMP, 'fake.mp3')
@@ -296,10 +217,6 @@ test('phone layout: stage first, no horizontal scroll', async ({ browser }) => {
   await ctx.close()
 })
 
-const engineState = (page: Page) => page.evaluate(() => {
-  const e = (window as unknown as { orbit: { engine: { time: () => number; playing: boolean } } }).orbit.engine
-  return { t: e.time(), playing: e.playing }
-})
 
 test('turning Loop off while playing ends at the end of the cycle', async ({ page }) => {
   test.setTimeout(60_000)
@@ -330,7 +247,7 @@ test('seeking right before a loop boundary keeps the clock consistent', async ({
 
 test('a Perform click without moving hands the voice back to its path', async ({ page }) => {
   await openWith(page, PASS_DOC)
-  await page.getByRole('button', { name: /Perform/ }).click()
+  await page.getByRole('button', { name: 'Perform', exact: true }).click()
   await page.getByTestId('play').click()
   await page.waitForTimeout(500)
   const box = (await page.getByTestId('stage').boundingBox())!
@@ -348,6 +265,7 @@ test('a Perform click without moving hands the voice back to its path', async ({
 
 test('undo back to the original document is saved too', async ({ page }) => {
   await openWith(page, null)
+  await page.getByRole('button', { name: 'Plucks', exact: true }).click()
   await page.getByRole('button', { name: /Pass L→R/ }).click()
   await page.waitForTimeout(500)
   await page.getByRole('button', { name: 'Undo' }).click()

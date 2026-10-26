@@ -100,10 +100,24 @@ export async function renderArrangement(doc: OrbitDoc, bank: SampleBank): Promis
   return { left: out.getChannelData(0).slice(), right: out.getChannelData(1).slice(), sampleRate: ENGINE_RATE }
 }
 
+/** Whether live audio can be heard: the context exists and its clock runs. */
+export type AudioState = 'off' | 'running' | 'suspended' | 'unavailable'
+/** How long to wait for `resume()` before reporting the context as blocked (some browsers never settle). */
+const RESUME_TIMEOUT_MS = 1500
+
+export interface StereoLevel {
+  /** sample peak per channel over the analyser window, linear */
+  left: number
+  right: number
+}
+
 export class OrbitEngine {
   readonly bank = new SampleBank()
   private ctx: AudioContext | null = null
   private master: GainNode | null = null
+  /** Live-only measurement tap on the master output (never part of the export graph). */
+  private meters: { left: AnalyserNode; right: AnalyserNode; scratch: Float32Array<ArrayBuffer> } | null = null
+  onStateChange: ((s: AudioState) => void) | null = null
   private doc: OrbitDoc | null = null
   private active: ActiveVoice[] = []
   /** scheduled cycles: index → context time at which piece time 0 occurs */
@@ -132,9 +146,42 @@ export class OrbitEngine {
       placeListener(this.ctx)
       this.master = new GainNode(this.ctx, { gain: MASTER_GAIN })
       this.master.connect(this.ctx.destination)
+      // Metering taps the master in parallel; analysers have no output, so the heard signal is unchanged.
+      const split = new ChannelSplitterNode(this.ctx, { numberOfOutputs: 2 })
+      const left = new AnalyserNode(this.ctx, { fftSize: 1024 })
+      const right = new AnalyserNode(this.ctx, { fftSize: 1024 })
+      this.master.connect(split)
+      split.connect(left, 0)
+      split.connect(right, 1)
+      this.meters = { left, right, scratch: new Float32Array(1024) }
+      this.ctx.onstatechange = () => this.onStateChange?.(this.audioState)
     }
-    if (this.ctx.state === 'suspended') await this.ctx.resume()
+    if (this.ctx.state !== 'running') {
+      // iOS reports 'interrupted' after a call or backgrounding; resume() covers both.
+      let timer = 0
+      await Promise.race([this.ctx.resume().catch(() => undefined), new Promise((r) => (timer = window.setTimeout(r, RESUME_TIMEOUT_MS)))])
+      window.clearTimeout(timer)
+    }
+    this.onStateChange?.(this.audioState)
     return this.ctx
+  }
+
+  get audioState(): AudioState {
+    if (!this.ctx) return 'off'
+    return this.ctx.state === 'running' ? 'running' : this.ctx.state === 'closed' ? 'off' : 'suspended'
+  }
+
+  /** Measured output level right now (live playback only); null before audio has started. */
+  level(): StereoLevel | null {
+    const m = this.meters
+    if (!m || !this.playing) return null
+    const peakOf = (a: AnalyserNode) => {
+      a.getFloatTimeDomainData(m.scratch)
+      let p = 0
+      for (let i = 0; i < m.scratch.length; i++) p = Math.max(p, Math.abs(m.scratch[i]!))
+      return p
+    }
+    return { left: peakOf(m.left), right: peakOf(m.right) }
   }
 
   get context(): AudioContext | null {
@@ -330,8 +377,11 @@ export class OrbitEngine {
     this.generation++
     this.stopAll()
     this.playing = false
+    if (this.ctx) this.ctx.onstatechange = null
     await this.ctx?.close()
     this.ctx = null
+    this.master = null
+    this.meters = null
   }
 }
 

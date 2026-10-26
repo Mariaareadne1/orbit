@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'r
 import { commit, createHistory, preview, push, redo, reset, undo, type History } from './history'
 import { COLORS, defaultDoc, MAX_VOICES, newId, type BuiltinId, type OrbitDoc, type VoiceDoc } from './document'
 import { files, loadDoc, saveDoc } from './storage'
-import { OrbitEngine } from '../audio/engine'
+import { OrbitEngine, type AudioState } from '../audio/engine'
 import { decodeAudioFile } from '../audio/importAudio'
 import { registerDebug } from '../debug'
+
+const STORAGE_FULL = 'Browser storage is full; this orbit is not being saved. Free some space, then press Save.'
 
 type Action =
   | { type: 'preview'; doc: OrbitDoc }
@@ -41,6 +43,10 @@ export function useOrbit() {
   const [notice, setNotice] = useState<string | null>(
     boot.status === 'unreadable' ? `Your saved orbit couldn’t be read (${boot.reason}). A copy was kept in this browser; starting fresh.` : null,
   )
+  const [audio, setAudio] = useState<AudioState>('off')
+  /** when the document was last written to storage; null = not yet this session */
+  const [savedAt, setSavedAt] = useState<Date | null>(null)
+  const [saveFailed, setSaveFailed] = useState(false)
   /** voice ids whose imported audio could not be restored */
   const [missing, setMissing] = useState<string[]>([])
   const [playing, setPlaying] = useState(false)
@@ -84,16 +90,27 @@ export function useOrbit() {
     }
   }, [engine])
 
+  /** Write to storage and report the outcome; a success after a failure clears the warning. */
+  const write = useCallback((d: OrbitDoc) => {
+    if (saveDoc(d)) {
+      lastSaved.current = d
+      setSavedAt(new Date())
+      setSaveFailed(false)
+      setNotice((n) => (n === STORAGE_FULL ? null : n))
+      return true
+    }
+    setSaveFailed(true)
+    setNotice(STORAGE_FULL)
+    return false
+  }, [])
+
   // Autosave once something changed; never during a gesture.
   const gestureOpen = history.gestureStart !== null
   useEffect(() => {
     if (gestureOpen || doc === lastSaved.current || (lastSaved.current === null && doc === initial.current)) return
-    const t = window.setTimeout(() => {
-      if (saveDoc(doc)) lastSaved.current = doc
-      else setNotice('Browser storage is full; this orbit is not being saved.')
-    }, 300)
+    const t = window.setTimeout(() => write(doc), 300)
     return () => window.clearTimeout(t)
-  }, [doc, gestureOpen])
+  }, [doc, gestureOpen, write])
 
   // Flush when the page is hidden so an edit inside the save delay survives a close.
   useEffect(() => {
@@ -111,9 +128,20 @@ export function useOrbit() {
 
   useEffect(() => {
     engine.onEnded = () => setPlaying(false)
+    engine.onStateChange = setAudio
     return () => {
+      engine.onStateChange = null
       void engine.dispose()
     }
+  }, [engine])
+
+  // Coming back to the tab: browsers (iOS especially) may have suspended the context.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible' && engine.context && engine.audioState !== 'running') void engine.ensureContext()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
   }, [engine])
 
   useEffect(() => registerDebug({ engine, doc: () => latest.current }), [engine])
@@ -132,9 +160,20 @@ export function useOrbit() {
       redo: () => dispatch({ type: 'redo' }),
       patchVoice,
       play: async () => {
-        await engine.play(latest.current)
-        setPlaying(true)
+        try {
+          await engine.play(latest.current)
+        } catch {
+          setAudio('unavailable')
+          setNotice('This browser could not start Web Audio, so nothing can play here. Export WAV still works.')
+          return
+        }
+        setPlaying(engine.playing)
       },
+      /** Retry starting audio after the browser refused (must run inside a user gesture). */
+      unlockAudio: async () => {
+        await engine.ensureContext()
+      },
+      saveNow: () => write(latest.current),
       pause: () => {
         engine.pause()
         setPlaying(false)
@@ -198,13 +237,17 @@ export function useOrbit() {
       dismissNotice: () => setNotice(null),
       setNotice,
     }),
-    [engine, patchVoice],
+    [engine, patchVoice, write],
   )
 
   return {
     doc,
     engine,
     playing,
+    audio,
+    savedAt,
+    saveFailed,
+    dirty: doc !== lastSaved.current && !(lastSaved.current === null && doc === initial.current),
     notice,
     missing,
     canUndo: history.past.length > 0 || gestureOpen,

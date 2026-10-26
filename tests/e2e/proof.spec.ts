@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { probeWav } from './helpers'
 
 interface Report {
   sampleRate: number
@@ -77,17 +78,9 @@ test('the rendered sweep exports as a valid WAV that external tools agree with',
   expect(py.firstSecondBalanceDb).toBeLessThan(-3)
   expect(py.lastSecondBalanceDb).toBeGreaterThan(3)
   expect(py.peak).toBeLessThan(1)
-  const ffprobe = process.env.FFPROBE ?? `${process.env.HOME}/Developer/FrameFlow/node_modules/ffprobe-static/bin/darwin/arm64/ffprobe`
-  try {
-    const probe = execFileSync(ffprobe, ['-v', 'error', '-show_entries', 'stream=codec_name,sample_rate,channels:format=duration', '-of', 'json', file], { encoding: 'utf8' })
-    const j = JSON.parse(probe)
-    console.log('[ffprobe]', JSON.stringify(j))
-    expect(j.streams[0].codec_name).toBe('pcm_s16le')
-    expect(Number(j.streams[0].sample_rate)).toBe(48000)
-    expect(j.streams[0].channels).toBe(2)
-    expect(Number(j.format.duration)).toBeCloseTo(6, 3)
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') test.info().annotations.push({ type: 'note', description: 'ffprobe not available; python check only' })
-    else throw err
-  }
+  const probe = probeWav(file)
+  console.log('[ffprobe]', JSON.stringify(probe))
+  expect(probe, 'a working ffprobe (ffprobe-static dev dependency)').not.toBeNull()
+  expect(probe).toMatchObject({ codec: 'pcm_s16le', sampleRate: 48000, channels: 2 })
+  expect(probe!.duration).toBeCloseTo(6, 3)
 })

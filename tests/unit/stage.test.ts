@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mergeRecording, strokeToPath } from '../../src/ui/Stage'
+import { mergeRecording, strokeToPath } from '../../src/ui/gestures'
 import { positionAt } from '../../src/audio/path'
 
 describe('mergeRecording', () => {

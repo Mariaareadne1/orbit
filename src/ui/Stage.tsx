@@ -1,10 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
-import { azimuth, clampToRadius, distance, screenToStage, stageToScreen, type StagePoint } from '../audio/coords'
+import { azimuth, clampToRadius, distance, screenToStage, type StagePoint } from '../audio/coords'
 import { positionAt, type Keyframe } from '../audio/path'
 import { STAGE_RADIUS, type OrbitDoc, type VoiceDoc } from '../state/document'
 import type { OrbitEngine } from '../audio/engine'
+import { CENTER, SCALE, VIEW, toScreen } from './geometry'
+import { mergeRecording, strokeToPath } from './gestures'
+import { shapeOf, shapePath } from './identity'
+import { fmtWhere } from './format'
 
 export type Tool = 'place' | 'draw' | 'perform'
+
+/** A Perform gesture in progress: which voice, and the piece time it started at. */
+export interface Recording {
+  id: string
+  from: number
+}
 
 interface StageProps {
   doc: OrbitDoc
@@ -12,67 +22,42 @@ interface StageProps {
   playing: boolean
   selected: string | null
   tool: Tool
-  onSelect: (id: string) => void
+  /** `open` asks for the sound's card (a deliberate pick), not just selection */
+  onSelect: (id: string, open: boolean) => void
   onPreviewPath: (id: string, path: Keyframe[]) => void
   onCommitPath: (id: string, path: Keyframe[]) => void
   onTime: (t: number) => void
+  onRecording: (r: Recording | null, recordedSeconds?: number) => void
+  onHint: (text: string) => void
   /** when paused, the time to draw at (changes on seek so the stage redraws) */
   stillTime: number
 }
 
-const SIZE = 640
-const C = SIZE / 2
-const SCALE = (SIZE / 2 - 46) / STAGE_RADIUS
+const R = STAGE_RADIUS * SCALE
 const TRAIL_SECONDS = 1.4
 const RECORD_SPACING = 0.04
+/** a press on a source in Place mode only moves it after this much travel (px), so a click just selects */
+const DRAG_SLOP = 4
+const CHEVRON_EVERY = 64
 
-const toScreen = (p: StagePoint) => stageToScreen(p, C, C, SCALE)
+type Gesture =
+  /** `at` is the latest placed point: committed as-is, never re-read from a document that may not have re-rendered yet */
+  | { kind: 'place'; id: string; moved: boolean; x0: number; y0: number; at: StagePoint | null }
+  /** points live on the gesture so a fast flick commits everything, rendered or not */
+  | { kind: 'draw'; id: string; points: StagePoint[] }
+  | { kind: 'perform'; id: string; rec: Keyframe[]; lastT: number }
 
-/** Resample a freehand stroke to evenly spaced keyframes across the piece. */
-export function strokeToPath(points: StagePoint[], duration: number, count = 96): Keyframe[] {
-  if (points.length < 2) return []
-  const lengths = [0]
-  for (let i = 1; i < points.length; i++) lengths.push(lengths[i - 1]! + Math.hypot(points[i]!.x - points[i - 1]!.x, points[i]!.y - points[i - 1]!.y))
-  const total = lengths[lengths.length - 1]!
-  if (total < 0.2) return []
-  const out: Keyframe[] = []
-  let j = 1
-  for (let i = 0; i <= count; i++) {
-    const target = (total * i) / count
-    while (j < lengths.length - 1 && lengths[j]! < target) j++
-    const a = points[j - 1]!
-    const b = points[j]!
-    const span = lengths[j]! - lengths[j - 1]!
-    const f = span > 0 ? (target - lengths[j - 1]!) / span : 0
-    out.push({ t: +((duration * i) / count).toFixed(4), x: +(a.x + (b.x - a.x) * f).toFixed(3), y: +(a.y + (b.y - a.y) * f).toFixed(3) })
-  }
-  return out
-}
-
-/** Replace the part of `path` between the first and last recorded times with the recording. */
-export function mergeRecording(path: readonly Keyframe[], rec: readonly Keyframe[]): Keyframe[] {
-  if (rec.length === 0) return [...path]
-  const t0 = rec[0]!.t
-  const t1 = rec[rec.length - 1]!.t
-  const before = path.filter((k) => k.t < t0)
-  const after = path.filter((k) => k.t > t1)
-  // Hold the old path's position right up to the recording, and resume it right
-  // after, so the untouched stretches don't drift toward the recorded points.
-  const lastBefore = before[before.length - 1]
-  const anchorBefore = t0 > 0.002 && (!lastBefore || lastBefore.t < t0 - 0.002) ? [{ t: t0 - 0.001, ...positionAt(path, t0 - 0.001) }] : []
-  const firstAfter = after[0]
-  const anchorAfter = firstAfter && firstAfter.t > t1 + 0.002 ? [{ t: t1 + 0.001, ...positionAt(path, t1 + 0.001) }] : []
-  return [...before, ...anchorBefore, ...rec, ...anchorAfter, ...after]
-}
-
-export function Stage({ doc, engine, playing, selected, tool, onSelect, onPreviewPath, onCommitPath, onTime, stillTime }: StageProps) {
+export function Stage({ doc, engine, playing, selected, tool, onSelect, onPreviewPath, onCommitPath, onTime, onRecording, onHint, stillTime }: StageProps) {
   const svg = useRef<SVGSVGElement>(null)
   const nodes = useRef(new Map<string, SVGGElement>())
   const trails = useRef(new Map<string, SVGPolylineElement>())
+  const readout = useRef<SVGTextElement>(null)
   const [stroke, setStroke] = useState<StagePoint[] | null>(null)
-  const gesture = useRef<{ kind: Tool; id: string; rec: Keyframe[]; lastT: number } | null>(null)
+  const gesture = useRef<Gesture | null>(null)
   const docRef = useRef(doc)
   docRef.current = doc
+  const selectedRef = useRef(selected)
+  selectedRef.current = selected
 
   // Draw loop: reads the engine clock and the same path interpolation the audio uses.
   useEffect(() => {
@@ -84,6 +69,7 @@ export function Stage({ doc, engine, playing, selected, tool, onSelect, onPrevie
         const p = engine.position(v, t)
         const s = toScreen(p)
         nodes.current.get(v.id)?.setAttribute('transform', `translate(${s.px.toFixed(1)} ${s.py.toFixed(1)})`)
+        if (v.id === selectedRef.current && readout.current) readout.current.textContent = fmtWhere(p)
         const trail = trails.current.get(v.id)
         if (trail) {
           const pts: string[] = []
@@ -103,46 +89,66 @@ export function Stage({ doc, engine, playing, selected, tool, onSelect, onPrevie
     }
     frame()
     return () => cancelAnimationFrame(raf)
-  }, [engine, playing, doc, onTime, stillTime])
+  }, [engine, playing, doc, onTime, stillTime, selected])
 
-  const pointFromEvent = (e: React.PointerEvent): StagePoint => {
+  const pointAt = (clientX: number, clientY: number): StagePoint => {
     const r = svg.current!.getBoundingClientRect()
-    const px = ((e.clientX - r.left) / r.width) * SIZE
-    const py = ((e.clientY - r.top) / r.height) * SIZE
-    const p = clampToRadius(screenToStage(px, py, C, C, SCALE), STAGE_RADIUS)
+    const px = ((clientX - r.left) / r.width) * VIEW
+    const py = ((clientY - r.top) / r.height) * VIEW
+    const p = clampToRadius(screenToStage(px, py, CENTER, CENTER, SCALE), STAGE_RADIUS)
     return { x: +p.x.toFixed(3), y: +p.y.toFixed(3) }
   }
 
-  const voice = doc.voices.find((v) => v.id === selected) ?? null
+  const startPerform = (id: string, p: StagePoint) => {
+    const t = engine.time()
+    gesture.current = { kind: 'perform', id, rec: [{ t, ...p }], lastT: t }
+    engine.grab(id, p)
+    onRecording({ id, from: t })
+  }
 
   const onDown = (e: React.PointerEvent<SVGSVGElement>) => {
-    if (e.button !== 0 || !voice) return
-    const target = (e.target as Element).closest('[data-voice]')
-    if (target && target.getAttribute('data-voice') !== voice.id && tool !== 'draw') {
-      onSelect(target.getAttribute('data-voice')!)
+    if (e.button !== 0) return
+    const hit = (e.target as Element).closest('[data-voice]')?.getAttribute('data-voice') ?? null
+    const switching = hit !== null && hit !== selected
+    // Picking a sound in Place opens its card; in Draw/Perform a press just selects (the card would cover the floor).
+    if (hit) onSelect(hit, tool === 'place')
+    const id = hit ?? selected
+    if (!id) {
+      onHint('Select a sound first: click one on the stage or a lane in the score.')
       return
     }
-    e.currentTarget.setPointerCapture(e.pointerId)
-    const p = pointFromEvent(e)
+    const p = pointAt(e.clientX, e.clientY)
     if (tool === 'place') {
-      gesture.current = { kind: 'place', id: voice.id, rec: [], lastT: 0 }
-      onPreviewPath(voice.id, [{ t: 0, ...p }])
+      e.currentTarget.setPointerCapture(e.pointerId)
+      // A press on empty space places the selected sound there at once.
+      gesture.current = { kind: 'place', id, moved: hit === null, x0: e.clientX, y0: e.clientY, at: hit === null ? p : null }
+      if (hit === null) onPreviewPath(id, [{ t: 0, ...p }])
     } else if (tool === 'draw') {
-      gesture.current = { kind: 'draw', id: voice.id, rec: [], lastT: 0 }
+      if (switching) return // first press on another sound selects it
+      e.currentTarget.setPointerCapture(e.pointerId)
+      gesture.current = { kind: 'draw', id, points: [p] }
       setStroke([p])
-    } else if (tool === 'perform' && playing) {
-      const t = engine.time()
-      gesture.current = { kind: 'perform', id: voice.id, rec: [{ t, ...p }], lastT: t }
-      engine.grab(voice.id, p)
+    } else if (playing) {
+      e.currentTarget.setPointerCapture(e.pointerId)
+      startPerform(id, p)
+    } else {
+      onHint('Perform records against the music: press play first.')
     }
   }
 
   const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
     const g = gesture.current
     if (!g) return
-    const p = pointFromEvent(e)
-    if (g.kind === 'place') onPreviewPath(g.id, [{ t: 0, ...p }])
-    else if (g.kind === 'draw') setStroke((s) => (s ? [...s, p] : [p]))
+    const p = pointAt(e.clientX, e.clientY)
+    if (g.kind === 'place') {
+      if (!g.moved && Math.hypot(e.clientX - g.x0, e.clientY - g.y0) < DRAG_SLOP) return
+      g.moved = true
+      g.at = p
+      onPreviewPath(g.id, [{ t: 0, ...p }])
+    } else if (g.kind === 'draw') {
+      g.points.push(p)
+      setStroke([...g.points])
+    }
     else {
       const t = engine.time()
       engine.grab(g.id, p)
@@ -160,123 +166,196 @@ export function Stage({ doc, engine, playing, selected, tool, onSelect, onPrevie
     gesture.current = null
     if (!g) return
     const v = docRef.current.voices.find((x) => x.id === g.id)
-    if (g.kind === 'perform') engine.release()
+    if (g.kind === 'perform') {
+      engine.release()
+      const seconds = g.rec.length > 1 ? g.rec[g.rec.length - 1]!.t - g.rec[0]!.t : 0
+      onRecording(null, seconds)
+      if (v && g.rec.length > 1) onCommitPath(g.id, mergeRecording(v.path, g.rec))
+      return
+    }
     if (!v) return
-    if (g.kind === 'place') onCommitPath(g.id, positionsOrSelf(v))
-    else if (g.kind === 'draw') {
-      const path = strokeToPath(stroke ?? [], docRef.current.duration)
+    if (g.kind === 'place') {
+      if (g.at) onCommitPath(g.id, [{ t: 0, ...g.at }])
+    } else {
+      const path = strokeToPath(g.points, docRef.current.duration)
       setStroke(null)
       if (path.length) onCommitPath(g.id, path)
-    } else if (g.rec.length > 1) {
-      onCommitPath(g.id, mergeRecording(v.path, g.rec))
     }
   }
 
-  // Keyboard nudge for a static voice (Place tool).
+  // Keyboard: Enter opens a focused source's card; arrows nudge a fixed source. Held arrows are one undo step.
+  const nudging = useRef<{ id: string; path: Keyframe[] } | null>(null)
   const onKey = (e: React.KeyboardEvent) => {
-    if (!voice || tool !== 'place') return
+    const id = (e.target as Element).closest('[data-voice]')?.getAttribute('data-voice')
+    const v = docRef.current.voices.find((x) => x.id === id)
+    if (!v) return
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      onSelect(v.id, true)
+      return
+    }
     const step = e.shiftKey ? 0.5 : 0.1
     const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, step], ArrowDown: [0, -step] }[e.key]
     if (!d) return
     e.preventDefault()
-    const cur = positionAt(voice.path, engine.time())
+    if (v.id !== selected) onSelect(v.id, false)
+    if (v.path.length > 1) {
+      onHint(`${v.name} follows a path. Use “Hold here” on its card to fix it in place, then nudge.`)
+      return
+    }
+    const cur = nudging.current?.id === v.id ? nudging.current.path[0]! : v.path[0]!
     const p = clampToRadius({ x: cur.x + d[0]!, y: cur.y + d[1]! }, STAGE_RADIUS)
-    onCommitPath(voice.id, [{ t: 0, x: +p.x.toFixed(3), y: +p.y.toFixed(3) }])
+    const path = [{ t: 0, x: +p.x.toFixed(3), y: +p.y.toFixed(3) }]
+    nudging.current = { id: v.id, path }
+    onPreviewPath(v.id, path)
+  }
+  const onKeyUp = () => {
+    const n = nudging.current
+    nudging.current = null
+    if (n) onCommitPath(n.id, n.path)
   }
 
-  const sel = voice ? engine.position(voice) : null
+  const t = playing ? engine.time() : Math.max(0, stillTime)
 
   return (
-    <div className="stage-wrap">
-      <svg
-        ref={svg}
-        viewBox={`0 0 ${SIZE} ${SIZE}`}
-        className={`stage stage--${tool}${tool === 'perform' && !playing ? ' stage--idle' : ''}`}
-        role="application"
-        aria-roledescription="soundstage"
-        aria-label={voice && sel ? `Soundstage. ${voice.name} is ${distance(sel).toFixed(1)} metres away at ${Math.round(azimuth(sel))} degrees.` : 'Soundstage'}
-        tabIndex={0}
-        onPointerDown={onDown}
-        onPointerMove={onMove}
-        onPointerUp={finish}
-        onPointerCancel={finish}
-        onKeyDown={onKey}
-        data-testid="stage"
-      >
-        <defs>
-          <radialGradient id="floor" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stopColor="#141826" />
-            <stop offset="100%" stopColor="#07080c" />
-          </radialGradient>
-          <filter id="glow" x="-1" y="-1" width="3" height="3"><feGaussianBlur stdDeviation="6" /></filter>
-        </defs>
-        <circle cx={C} cy={C} r={STAGE_RADIUS * SCALE + 18} fill="url(#floor)" />
-        {[1, 2, 3, 4, 5].map((m) => (
-          <g key={m}>
-            <circle cx={C} cy={C} r={m * SCALE} className={m === 5 ? 'ring ring--edge' : 'ring'} />
-            <text x={C + 4} y={C - m * SCALE + 12} className="ring-label">{m} m</text>
+    <svg
+      ref={svg}
+      viewBox={`0 0 ${VIEW} ${VIEW}`}
+      className={`stage stage--${tool}${tool === 'perform' && !playing ? ' stage--idle' : ''}`}
+      role="group"
+      aria-roledescription="soundstage"
+      aria-label="Soundstage, seen from above. The listener is at the centre facing the top; rings every metre to 5 m."
+      onPointerDown={onDown}
+      onPointerMove={onMove}
+      onPointerUp={finish}
+      onPointerCancel={finish}
+      onLostPointerCapture={() => gesture.current && finish()}
+      onKeyDown={onKey}
+      onKeyUp={onKeyUp}
+      onBlur={onKeyUp}
+      data-testid="stage"
+    >
+      <defs>
+        <radialGradient id="field" cx="50%" cy="50%" r="50%">
+          <stop offset="0%" stopColor="#1a1f3a" />
+          <stop offset="70%" stopColor="#121530" />
+          <stop offset="100%" stopColor="#0f1126" />
+        </radialGradient>
+      </defs>
+      <Calibration />
+      {doc.voices.map((v) => <PathLine key={v.id} voice={v} selected={v.id === selected} />)}
+      <Listener />
+      {stroke && stroke.length > 1 && (
+        <polyline points={stroke.map((p) => { const s = toScreen(p); return `${s.px.toFixed(1)},${s.py.toFixed(1)}` }).join(' ')} className="stroke" />
+      )}
+      {doc.voices.map((v) => (
+        <polyline key={`trail-${v.id}`} ref={(el) => { if (el) trails.current.set(v.id, el); else trails.current.delete(v.id) }} className="trail" style={{ stroke: v.color }} />
+      ))}
+      {doc.voices.map((v, i) => {
+        const p = positionAt(v.path, t)
+        const shape = shapePath(shapeOf(v, i), 9)
+        const isSel = v.id === selected
+        return (
+          <g key={v.id} ref={(el) => { if (el) nodes.current.set(v.id, el); else nodes.current.delete(v.id) }}
+            data-voice={v.id} data-testid={`node-${v.name}`} tabIndex={0} role="button"
+            aria-pressed={isSel}
+            aria-label={`${v.name}${v.mute ? ', muted' : ''}${v.solo ? ', solo' : ''}: ${distance(p).toFixed(1)} metres at ${Math.round(azimuth(p))} degrees${v.path.length > 1 ? ', moving' : ''}`}
+            className={`source${isSel ? ' is-selected' : ''}${v.mute ? ' is-muted' : ''}`}>
+            <circle r="22" className="source__hit" />
+            {isSel && <circle r="17" className="source__ring" />}
+            <path d={shape} className="source__shape" style={{ fill: v.mute ? 'none' : v.color, stroke: v.mute ? v.color : undefined }} />
+            <text y="-24" className="source__label">{v.name}{v.solo ? ' · S' : ''}</text>
+            {isSel && <text ref={readout} y="34" className="source__readout">{fmtWhere(p)}</text>}
           </g>
-        ))}
-        {Array.from({ length: 12 }, (_, i) => i * 30).map((deg) => {
-          const a = (deg * Math.PI) / 180
-          const r1 = STAGE_RADIUS * SCALE
-          return <line key={deg} x1={C + Math.sin(a) * (r1 - 6)} y1={C - Math.cos(a) * (r1 - 6)} x2={C + Math.sin(a) * (r1 + 6)} y2={C - Math.cos(a) * (r1 + 6)} className="tick" />
-        })}
-        <text x={C} y={14} className="compass">FRONT · 0°</text>
-        <text x={SIZE - 4} y={C + 4} className="compass compass--end">R 90°</text>
-        <text x={C} y={SIZE - 6} className="compass">BACK · 180°</text>
-        <text x={4} y={C + 4} className="compass compass--start">L 90°</text>
-
-        {doc.voices.map((v) => (
-          <PathLine key={v.id} voice={v} selected={v.id === selected} />
-        ))}
-
-        <g className="listener" transform={`translate(${C} ${C})`} aria-hidden="true">
-          <ellipse rx="11" ry="13" className="listener__head" />
-          <path d="M-4 -12 L0 -19 L4 -12" className="listener__nose" />
-          <ellipse cx="-12" cy="0" rx="2.5" ry="5" className="listener__ear" />
-          <ellipse cx="12" cy="0" rx="2.5" ry="5" className="listener__ear" />
-        </g>
-
-        {stroke && stroke.length > 1 && (
-          <polyline points={stroke.map((p) => { const s = toScreen(p); return `${s.px},${s.py}` }).join(' ')} className="stroke" />
-        )}
-
-        {doc.voices.map((v) => (
-          <polyline key={`trail-${v.id}`} ref={(el) => { if (el) trails.current.set(v.id, el); else trails.current.delete(v.id) }} className="trail" style={{ stroke: v.color }} />
-        ))}
-        {doc.voices.map((v) => (
-          <g key={v.id} ref={(el) => { if (el) nodes.current.set(v.id, el); else nodes.current.delete(v.id) }} data-voice={v.id} data-testid={`node-${v.name}`} className={`node${v.id === selected ? ' is-selected' : ''}${v.mute ? ' is-muted' : ''}`}>
-            <circle r="16" fill={v.color} filter="url(#glow)" opacity="0.55" />
-            <circle r="9" fill={v.color} className="node__core" />
-            {v.id === selected && <circle r="15" className="node__ring" style={{ stroke: v.color }} />}
-            <text y="-22" className="node__label">{v.name}</text>
-          </g>
-        ))}
-      </svg>
-      <p className="stage-help" aria-live="polite">
-        {!voice ? 'Select a voice to move it.'
-          : tool === 'place' ? `Place: drag ${voice.name} to a fixed spot, or use the arrow keys.`
-          : tool === 'draw' ? `Draw: sketch ${voice.name}'s path — the stroke is spread across the whole piece.`
-          : playing ? `Perform: hold and move to record ${voice.name}'s motion live; it replaces that stretch of the path.`
-          : 'Perform: press play first, then move the voice in time with the music.'}
-      </p>
-    </div>
+        )
+      })}
+    </svg>
   )
 }
 
-function positionsOrSelf(v: VoiceDoc): Keyframe[] {
-  return v.path
+/** Rings every metre, azimuth scale every 10°, axes. Pure geometry, drawn once per render. */
+function Calibration() {
+  const ticks = Array.from({ length: 36 }, (_, i) => i * 10)
+  const label = (deg: number) => (deg === 0 ? 'FRONT' : deg === 180 ? 'BACK' : deg === 90 ? 'R 90°' : deg === 270 ? 'L 90°' : deg < 180 ? `+${deg}°` : `−${360 - deg}°`)
+  return (
+    <g className="calibration" aria-hidden="true">
+      <circle cx={CENTER} cy={CENTER} r={R + 26} className="field-halo" />
+      <circle cx={CENTER} cy={CENTER} r={R} fill="url(#field)" />
+      <line x1={CENTER} y1={CENTER - R} x2={CENTER} y2={CENTER + R} className="axis" />
+      <line x1={CENTER - R} y1={CENTER} x2={CENTER + R} y2={CENTER} className="axis" />
+      {[1, 2, 3, 4, 5].map((m) => (
+        <g key={m}>
+          <circle cx={CENTER} cy={CENTER} r={m * SCALE} className={m === STAGE_RADIUS ? 'ring ring--edge' : 'ring'} />
+          <text x={CENTER + 5} y={CENTER - m * SCALE - 4} className="ring-label">{m} m</text>
+        </g>
+      ))}
+      {ticks.map((deg) => {
+        const a = (deg * Math.PI) / 180
+        const major = deg % 30 === 0
+        const r0 = R + 3
+        const r1 = R + (major ? 11 : 6)
+        const lr = R + 26
+        return (
+          <g key={deg}>
+            <line x1={CENTER + Math.sin(a) * r0} y1={CENTER - Math.cos(a) * r0} x2={CENTER + Math.sin(a) * r1} y2={CENTER - Math.cos(a) * r1} className={major ? 'tick tick--major' : 'tick'} />
+            {major && (
+              <text x={CENTER + Math.sin(a) * lr} y={CENTER - Math.cos(a) * lr + 3.5} className={`azimuth-label${deg % 90 === 0 ? ' azimuth-label--cardinal' : ''}`}>{label(deg)}</text>
+            )}
+          </g>
+        )
+      })}
+    </g>
+  )
+}
+
+/** The listener: head, ears and a nose pointing forward (−Z, the top of the stage), with a faint facing wedge. */
+function Listener() {
+  const wedge = (deg: number, r: number) => {
+    const a = (deg * Math.PI) / 180
+    return `${(CENTER + Math.sin(a) * r).toFixed(1)} ${(CENTER - Math.cos(a) * r).toFixed(1)}`
+  }
+  const reach = 1.4 * SCALE
+  return (
+    <g className="listener" aria-hidden="true">
+      <path d={`M${CENTER} ${CENTER} L${wedge(-28, reach)} A${reach} ${reach} 0 0 1 ${wedge(28, reach)} Z`} className="listener__facing" />
+      <g transform={`translate(${CENTER} ${CENTER})`}>
+        <ellipse cx="-13" cy="0" rx="3" ry="6" className="listener__ear" />
+        <ellipse cx="13" cy="0" rx="3" ry="6" className="listener__ear" />
+        <path d="M-5 -12.5 L0 -21 L5 -12.5" className="listener__nose" />
+        <ellipse rx="12" ry="14" className="listener__head" />
+        <text y="32" className="listener__label">LISTENER</text>
+      </g>
+    </g>
+  )
 }
 
 function PathLine({ voice, selected }: { voice: VoiceDoc; selected: boolean }) {
   if (voice.path.length < 2) return null
-  const pts = voice.path.map((k) => { const s = toScreen(k); return `${s.px.toFixed(1)},${s.py.toFixed(1)}` }).join(' ')
-  const first = toScreen(voice.path[0]!)
+  const pts = voice.path.map((k) => toScreen(k))
+  const line = pts.map((s) => `${s.px.toFixed(1)},${s.py.toFixed(1)}`).join(' ')
+  // Direction chevrons spaced along the path, so the drawing says which way the sound travels.
+  const chevrons: Array<{ x: number; y: number; deg: number }> = []
+  if (selected) {
+    let carry = CHEVRON_EVERY / 2
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1]!
+      const b = pts[i]!
+      const len = Math.hypot(b.px - a.px, b.py - a.py)
+      let d = carry
+      while (d < len) {
+        const f = d / len
+        chevrons.push({ x: a.px + (b.px - a.px) * f, y: a.py + (b.py - a.py) * f, deg: (Math.atan2(b.py - a.py, b.px - a.px) * 180) / Math.PI })
+        d += CHEVRON_EVERY
+      }
+      carry = d - len
+    }
+  }
+  const first = pts[0]!
   return (
-    <g className={`path${selected ? ' is-selected' : ''}`} style={{ stroke: voice.color, fill: voice.color }}>
-      <polyline points={pts} />
-      {selected && <circle cx={first.px} cy={first.py} r="3.5" className="path__start" />}
+    <g className={`path${selected ? ' is-selected' : ''}`} style={{ stroke: voice.color }} data-testid={`path-${voice.name}`}>
+      <polyline points={line} />
+      {selected && <circle cx={first.px} cy={first.py} r="3.5" className="path__start" style={{ fill: voice.color }} />}
+      {chevrons.map((c, i) => <path key={i} d="M-3.5 -3.5 L1.5 0 L-3.5 3.5" transform={`translate(${c.x.toFixed(1)} ${c.y.toFixed(1)}) rotate(${c.deg.toFixed(1)})`} className="path__chevron" />)}
     </g>
   )
 }
