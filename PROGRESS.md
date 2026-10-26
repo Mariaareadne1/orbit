@@ -95,3 +95,20 @@ DSP fixtures (offline, `tests/e2e/dsp.spec.ts`), Chromium / WebKit, balance R−
 noise ±2 m side −4.47/+4.42 | −5.37/+5.40 dB; 1 kHz sine side −6.43/+6.58 | −8.49/+8.35 dB;
 1 m vs 4 m ahead −12.0 dB (model −12.04); peaks ≤ 0.33, 0 clipped; every WAV decoded by python `wave`
 and ffprobe as pcm_s16le / 48 kHz / 2 ch / 4.000 s.
+
+## O5 — verification and ship ✔ (2026-10-26)
+- Local: typecheck ✔ · lint ✔ · unit 14/14 ✔ · build ✔ · E2E Chromium (fake sink) 36/36 ✔ ·
+  E2E WebKit (real device, clock stalled) 21/21 clock-independent tests ✔, 2 skipped by design.
+- Measured: live vs export balance max 0.06 dB (Chromium, fake sink; baseline 0.04 dB real device);
+  loop cycle vs cycle 0.04–0.06 dB.
+- Merged `redesign/spatial-theatre` → `main` (fast-forward, `cbbe2e4`); GitHub Actions run 40276179834:
+  build ✔, Linux Chromium E2E ✔, Pages deploy ✔.
+- Production https://mariaareadne1.github.io/orbit/ checked with Playwright: new UI and assets load under
+  /orbit/ with no 4xx or console errors, playback clock runs (fake sink), phone has no horizontal scroll,
+  exported WAV decoded by python `wave` + ffprobe: pcm_s16le, 48 kHz, 2 ch, 16.000 s, peak −8.2 dBFS, 0 clipped.
+
+## Remaining
+- Re-run the real-time E2E in WebKit (and Chromium without the fake sink) once this Mac's audio output
+  clock advances again; listen to an export on headphones.
+- Real iPhone/iPad: audio unlock, background/resume and touch were tested only in emulation.
+- Firefox untested. No elevation (sources at ear height); generic browser HRTF, weak front/back cues.
