@@ -29,3 +29,28 @@ IndexedDB abort no longer hangs imports, Length field editable, flush on pagehid
 - Perform recording stops at a loop wrap (it keeps what was recorded).
 - Firefox and real touch devices not tested; mobile Safari audio unlocking not verified on hardware.
 - Editing a path while it plays reschedules from "now"; a drag in Place mode during playback is heard live.
+
+---
+
+# Redesign — Spatial Sound Theatre (branch `redesign/spatial-theatre`)
+
+Resume here: each milestone below is ticked only after its checks ran. Baseline commit `d359749`.
+
+## O0 — evidence-first audit (2026-10-25) ✔
+- Clone: `~/Developer/design-engineering-build-2026/orbit`, `origin` = github.com/Mariaareadne1/orbit, `main` clean
+  and level with `origin/main` before branching. Pages deploys only from pushes to `main` (`.github/workflows/pages.yml`).
+- Dependency graph (from code): `App` → `useOrbit` (history reducer, autosave to localStorage `orbit.document.v1`,
+  IndexedDB `orbit/files` for imported bytes, boot-time orphan GC) → `OrbitEngine` (one AudioContext at 48 kHz,
+  per-cycle `AudioBufferSource → Gain → Panner(HRTF) → master Gain`, look-ahead loop scheduler 1.5 s / 100 ms tick,
+  generation token, grab/release for Perform). `Stage` draws `engine.position()` = `positionAt(path, engine.time())`,
+  the same interpolation `schedulePath` writes with `linearRampToValueAtTime`. Export = `renderArrangement` (same
+  `scheduleCycle`, OfflineAudioContext 48 kHz) → `encodeWav` 16-bit. Geometry in `src/audio/coords.ts`
+  (stage (x,y) → audio (x,0,−y), listener faces −Z) — verified in code and unit tests.
+- Machine audio: this time the real output device **does** advance the AudioContext clock in both Playwright
+  browsers, so the baseline below is real-device playback (headless; not listened to).
+- Baseline checks: `pnpm typecheck` ✔ · `pnpm lint` ✔ · `pnpm test` 14/14 ✔ · `pnpm build` ✔ ·
+  `pnpm test:e2e` 30 passed, 2 skipped by design (file checks run once, in Chromium).
+- Baseline audio: live vs export balance, 0.5 s windows over an 8 s L→R pass: max |Δ| **0.04 dB** (Chromium 156),
+  **0.05 dB** (WebKit 27.2). Proof sweep crossing 3.03 s / 3.02 s; distance 1 m vs 4 m −12.04 dB (model −12.04);
+  peak 0.40, 0 clipped. Sweep WAV: python `wave` 2 ch / 48 kHz / 6.000 s; ffprobe `pcm_s16le`.
+- Before screenshots: `docs/media/before/`.
